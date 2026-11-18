@@ -35,10 +35,121 @@ Gợi ý
 - `iou_xywh` có sẵn. Dòng nhãn hỏng không được làm script chết (dùng `ds.valid_boxes` và `parse_yolo_line` trong try).
 - Kết quả phụ thuộc mạnh vào ngưỡng: calibrate chúng ở Bước 3 thay vì đoán.
 """
-from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
-from ..model_cache import get_preds  # noqa: F401
+from ..common import WARN, Issue, iou_xywh, parse_yolo_line
+from ..model_cache import get_preds
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    conf_thresh = cfg["second_opinion"]["conf"]
+    min_area_px = cfg["second_opinion"]["min_area_px"]
+    fp_conf = cfg["second_opinion"]["fp_conf"]
+    iou_missing = cfg["second_opinion"]["iou_missing"]
+    iou_match = cfg["second_opinion"]["iou_match"]
+    iou_loose = cfg["second_opinion"]["iou_loose"]
+
+    issues = []
+
+    for img_p in ds.image_files():
+        stem = img_p.stem
+        if preds is None or stem not in preds:
+            continue
+        if not ds.label_path(stem).exists():
+            continue
+
+        img_size = ds.image_size(stem)
+        if img_size is None:
+            continue
+        W, H = img_size
+
+        stem_preds = preds.get(stem, [])
+        valid_labels = ds.valid_boxes(stem)
+
+        # 1. Dự đoán của model -> POSSIBLE_MISSING / POSSIBLE_LOOSE_BOX / POSSIBLE_WRONG_CLASS
+        P = [
+            r for r in stem_preds
+            if r[1] >= conf_thresh and (r[4] * W * r[5] * H) >= min_area_px
+        ]
+
+        for r in P:
+            r_cls = int(r[0])
+            r_conf = float(r[1])
+            r_box = (float(r[2]), float(r[3]), float(r[4]), float(r[5]))
+
+            cands = []
+            for l in valid_labels:
+                l_cls = int(l[0])
+                l_box = (float(l[1]), float(l[2]), float(l[3]), float(l[4]))
+                iou = iou_xywh(r_box, l_box)
+                if iou >= iou_missing:
+                    cands.append((l_cls, iou))
+
+            if not cands:
+                issues.append(Issue(
+                    "second_opinion",
+                    WARN,
+                    "POSSIBLE_MISSING",
+                    stem,
+                    f"model phát hiện lớp {r_cls} (conf={r_conf:.2f}) nhưng nhãn không có box",
+                    line=None,
+                    extra={"conf": r_conf},
+                ))
+            else:
+                same_cands = [c for c in cands if c[0] == r_cls]
+                if same_cands:
+                    best_same_iou = max(c[1] for c in same_cands)
+                    if best_same_iou < iou_loose:
+                        issues.append(Issue(
+                            "second_opinion",
+                            WARN,
+                            "POSSIBLE_LOOSE_BOX",
+                            stem,
+                            f"nhãn cùng lớp {r_cls} nhưng box lỏng/lệch (IoU={best_same_iou:.2f})",
+                            line=None,
+                            extra={"conf": r_conf, "iou": float(best_same_iou)},
+                        ))
+                else:
+                    best_diff_iou = max(c[1] for c in cands)
+                    if best_diff_iou >= iou_match:
+                        issues.append(Issue(
+                            "second_opinion",
+                            WARN,
+                            "POSSIBLE_WRONG_CLASS",
+                            stem,
+                            f"model đoán lớp {r_cls} nhưng nhãn gán lớp khác (IoU={best_diff_iou:.2f})",
+                            line=None,
+                            extra={"conf": r_conf, "iou": float(best_diff_iou)},
+                        ))
+
+        # 2. Nhãn hợp lệ -> POSSIBLE_FALSE_POS
+        fp_preds = [r for r in stem_preds if r[1] >= fp_conf]
+        raw_lines = ds.read_label_lines(stem) or []
+        n_classes = len(ds.classes)
+
+        for line_no, ln in raw_lines:
+            try:
+                c, cx, cy, w, h = parse_yolo_line(ln)
+            except ValueError:
+                continue
+            if c < 0 or c >= n_classes:
+                continue
+
+            l_box = (cx, cy, w, h)
+            max_iou = 0.0
+            if fp_preds:
+                max_iou = max(iou_xywh(l_box, (p[2], p[3], p[4], p[5])) for p in fp_preds)
+
+            if not fp_preds or max_iou < iou_missing:
+                issues.append(Issue(
+                    "second_opinion",
+                    WARN,
+                    "POSSIBLE_FALSE_POS",
+                    stem,
+                    f"box nhãn ở dòng {line_no} không khớp vật nào model thấy",
+                    line=line_no,
+                    extra={"iou": float(max_iou)},
+                ))
+
+    return issues
